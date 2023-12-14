@@ -1,0 +1,19 @@
+# Ignore everything:
+/*
+
+# Script
+!process_snps.nx
+
+# Run configs
+!run_configs/
+!nextflow.config
+
+# resources
+# !resources/
+
+
+# Supplimental
+!README.md
+!requirements.yml
+!.gitignore
+!.gitattributes

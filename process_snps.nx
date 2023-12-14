@@ -1,0 +1,582 @@
+/*
+Nextflow Script
+Author: Jon Doenier
+Date: 2023
+Description: Perform snp calling using GATK best practices pipeline
+Used for snp calling on malaria samples
+*/
+
+nextflow.enable.dsl=2
+
+println("RUN PARAMETERS")
+println(params.prefix)
+println(params.r1)
+println(params.r2)
+println("STARTING RUN")
+
+workflow {
+  /* 
+  Run dragen and BWA based pipelines in parallel
+  */
+  gatk_dragen([params.r1, params.r2], params.prefix + "remove_human")
+  gatk_sp(gatk_dragen.out.norm_reads, params.prefix + "remove_human")
+}
+
+
+workflow gatk_dragen {
+  /* 
+  Run standard Dragen GATK pipeline
+  */
+  take:
+      reads   // paired NGS reads
+      pubDir
+
+  main:
+    pubDir = pubDir + "dragen/"
+
+    remove_human(reads, pubDir)
+    norm_read_depth(remove_human.out.reads, pubDir)
+    malaria_dragen(norm_read_depth.out.reads, pubDir)    
+    clean_mapping(malaria_dragen.out.bam, pubDir)    
+    train_dragen_STR_model(clean_mapping.out.bam, pubDir)
+
+    intervals = generate_intervals().intervals.flatten()
+    haplotype_Caller_dragen(clean_mapping.out.bam, train_dragen_STR_model.out.params, intervals, pubDir)
+    combineGVCF(haplotype_Caller_dragen.out.vcf.collect(), pubDir)
+    filter_core_variant(combineGVCF.out.gvcf, pubDir)
+
+  emit:
+    norm_reads = norm_read_depth.out.reads
+}
+
+workflow gatk_sp {
+  /* 
+  Run BWA based GATK pipeline
+  */
+  take:
+      reads
+      pubDir
+
+  main:
+    pubDir = pubDir + "bwa/"
+    remove_human(reads, pubDir)
+    malaria_BWA(remove_human.out.reads, pubDir)
+    clean_mapping(malaria_BWA.out.sam, pubDir)    
+    call_variants(clean_mapping.out.bam, pubDir)
+}
+
+workflow call_variants {
+  /* 
+  Call variants based on mapped reads (BWA pipeline)
+  */
+  take:
+    bam
+    pubDir
+
+  main: 
+
+    pubDir = pubDir + "/call_variants/"
+
+    intervals = generate_intervals().intervals.flatten()
+
+    recalibrate_mapping(bam, intervals, pubDir)
+    haplotype_Caller(recalibrate_mapping.out.bam, recalibrate_mapping.out.interval, pubDir)
+
+    combineGVCF(haplotype_Caller.out.gvcf.collect(), pubDir)
+    genotypeGVCF(combineGVCF.out.gvcf, pubDir)
+    variant_recalibrator_snp(genotypeGVCF.out.gvcf, pubDir)
+    // variant_recalibrator_snp(combineGVCF.out.gvcf, pubDir)
+    applyVQSR_snp(genotypeGVCF.out.gvcf, variant_recalibrator_snp.out.table, variant_recalibrator_snp.out.tranche, pubDir)
+}
+
+workflow recalibrate_mapping {
+  /* 
+  Recalibate read mapping 
+  */
+  take:
+    bam
+    intervals
+    pubDir
+
+  main: 
+
+    pubDir = pubDir + "/recalibrate_bam/"
+
+    baseRecalibrator(bam, intervals, pubDir)
+    collect_recalibration_tables(baseRecalibrator.out.table.collect(), pubDir)
+    applyBQSR(bam, collect_recalibration_tables.out.recalibration_table, intervals, pubDir)
+    // collect_bams(applyBQSR.out.bam.collect(), pubDir)
+  emit:
+    // bam = collect_bams.out.bam
+    bam = applyBQSR.out.bam
+    interval = applyBQSR.out.interval
+}
+
+process remove_human {
+  /* 
+  Remove human contamination (RBS or user) from reads
+  */
+  publishDir { params.results + pubDir + "/" +  "remove_human" } , mode: "copy"
+
+  label 'mapping'
+
+  input:
+    tuple path(sR1), path(sR2)
+    val(pubDir)
+
+  output:
+    tuple path(clean_sR1), path(clean_sR2), emit: reads
+    path("*")
+
+  script:
+  clean_sR1 = "non_human_R1.fastq.gz"
+  clean_sR2 = "non_human_R2.fastq.gz"
+  clean_unpaired = "non_human_single.fastq.gz"
+  """
+  	bwa mem -t ${task.cpus} ${params.human_ref} ${sR1} ${sR2} > human_mapped.sam
+
+    samtools sort -t ${task.cpus} -@ 2G -o human_mapped.sorted.sam human_mapped.sam
+    samtools flagstat human_mapped.sorted.sam > human_mapped.stats.txt
+  	samtools view -b -q 20 -F 4 -U unmapped.bam human_mapped.sam > human_hq_mapped.bam
+
+  	samtools fastq -1 ${clean_sR1} -2 ${clean_sR2} -s ${clean_unpaired} unmapped.bam
+    samtools flagstat unmapped.bam > unmapped_read.stats.txt
+    samtools flagstat human_hq_mapped.bam > human_hq_mapped.stats.txt
+  """
+}
+
+process norm_read_depth {
+  /*
+  Normalize read depth to 25 million reads, higher coverage is not needed for variant calling
+  and increase runtime
+  */
+  publishDir { params.results + pubDir + "/" +  "sample_reads" } , mode: "copy"
+
+  label 'picard'
+
+  input:
+    tuple path(sR1), path(sR2)
+    val(pubDir)
+
+  output:
+    tuple path(sampled_sR1), path(sampled_sR2), emit: reads
+    path("*")
+
+  script:
+  sampled_sR1 = "sampled_mal_R1.fastq.gz"
+  sampled_sR2 = "sampled_mal_R2.fastq.gz"
+  """
+    seqtk sample -s 1 ${sR1} 25000000 | gzip > ${sampled_sR1}
+    seqtk sample -s 1 ${sR2} 25000000 | gzip > ${sampled_sR2}
+  """
+}
+
+process malaria_BWA {
+  /* 
+  Map reads to malaria genome using BWA
+  */
+  publishDir { params.results + pubDir + "/" + "malaria_mapping" } , mode: "copy"
+  label 'mapping'
+  
+  input:
+  	tuple path(sR1), path(sR2)
+    val(pubDir)
+
+  output:
+    path("malaria.sam"), emit: sam
+    path("*")
+    val(pubDir)
+
+  script:
+  
+  """
+  	bwa mem -M -t ${task.cpus} ${params.malaria_ref} ${sR1} ${sR2} > malaria.sam
+    samtools view -b malaria.sam > malaria.bam
+    samtools sort -@ ${task.cpus} malaria.bam > malaria.sorted.bam
+    samtools index malaria.sorted.bam
+    samtools flagstat malaria.sorted.bam > malaria.sorted.stats.txt
+  """
+}
+
+process malaria_dragen {
+  /* 
+  Map reads to malaria genome using dragen
+  */
+  publishDir { params.results + pubDir + "/" + "malaria_mapping" } , mode: "copy"
+  label 'mapping'
+  
+  input:
+    tuple path(sR1), path(sR2)
+    val(pubDir)
+
+  output:
+    path("malaria.sorted.bam"), emit: bam
+    path("*")
+    val(pubDir)
+
+  script:
+  
+  """
+    dragen-os --num-threads ${task.cpus} -r ${params.malaria_hash} -1 ${sR1} -2 ${sR2} > malaria.sam
+    samtools view -b malaria.sam > malaria.bam
+    samtools sort -@ ${task.cpus} malaria.bam > malaria.sorted.bam
+    samtools index malaria.sorted.bam
+    samtools flagstat malaria.sorted.bam > malaria.sorted.stats.txt
+  """
+}
+
+process clean_mapping {
+  /* 
+  Process read mapping with picard to remove duplicates and fix mate information
+  */
+  publishDir { params.results + pubDir + "/" + "picard_clean_sam" } , mode: "copy"
+  label 'picard'
+  
+  input:
+  	path(sam)
+    val(pubDir)
+
+  output:
+    path("cleaned_fixed_dedup_mapping.bam"), emit: bam
+    path("*")
+
+  script:
+  
+  """
+  	picard CleanSam --INPUT ${sam} --OUTPUT cleaned_mapping.sam
+  	picard FixMateInformation --INPUT cleaned_mapping.sam --OUTPUT cleaned_fixed_mapping.sam
+    
+    gatk SortSam --INPUT cleaned_fixed_mapping.sam --OUTPUT cleaned_fixed_mapping.sorted.sam --SORT_ORDER coordinate --MAX_RECORDS_IN_RAM 1000000
+    gatk MarkDuplicates --INPUT cleaned_fixed_mapping.sorted.sam --OUTPUT cleaned_fixed_dedup_mapping.sam --METRICS_FILE duplicate_reads.sam
+
+    picard AddOrReplaceReadGroups -I cleaned_fixed_dedup_mapping.sam -O cleaned_fixed_dedup_mapping.bam --RGID 1 --RGLB lib1 --RGPL illumina --RGPU x --RGSM x 
+    samtools index cleaned_fixed_dedup_mapping.bam
+  """
+}
+
+process generate_intervals {
+  /* 
+  Break genome into chunks to allow parallelization of variant calling
+  */
+	publishDir { params.results + "/" + "generate_intervals" } , mode: "copy"
+  label 'trivial'
+
+
+  output:
+    path("interval_*.bed"), emit: intervals
+    path("*")
+
+  script:
+  """
+		bedtools makewindows -g ${params.malaria_gen_file} -w 1500000 > genome.windows.bed
+		split --lines=1 -d --additional-suffix .bed genome.windows.bed interval_
+  """
+}
+
+process baseRecalibrator {
+  /* 
+  Recalibrate read mapping using known variants to increase gatk performance
+  */
+  publishDir { params.results + pubDir + "/" + "BQSR" } , mode: "copy"
+  label 'BQSR'
+  
+  input:
+  	path(bam)
+  	path(interval)
+  	val(pubDir)
+
+  output:
+    path(recal), emit: table
+    path("*")
+
+  script:
+  i = interval.getSimpleName()
+  recal = "recalibration_${i}.table"
+  """
+  	gatk BaseRecalibrator -R ${params.malaria_ref} -I ${bam} --known-sites ${params.var_1} --known-sites ${params.var_2} --known-sites ${params.var_3} --intervals ${interval} -O ${recal}
+  """
+}
+
+process collect_recalibration_tables {
+  /* 
+  Collect parallelized recalibration tables into a single table
+  */
+	publishDir { params.results + pubDir + "/" + "collect_recalibration_tables" } , mode: "copy"
+  label 'trivial'
+  
+  input:
+  	path(tables)
+  	val(pubDir)
+ 
+  output:
+    path("combined.table"), emit: recalibration_table
+    path("*")
+
+  script:
+  tab_string = tables.join(" -I ")
+  """
+    echo ${tab_string}
+		gatk GatherBQSRReports --input ${tab_string} --output combined.table
+  """
+}
+
+process applyBQSR {
+  /* 
+  Perform base quality score recalibration to improve gatk performance
+  */
+  publishDir { params.results + pubDir + "/" + "applyBQSR" } , mode: "copy"
+  label 'BQSR'
+  
+  input:
+  	path(bam)
+  	path(recalibration_table)
+  	path(interval)
+  	val(pubDir)
+
+  output:
+    path(recal), emit: bam
+    path(interval), emit:interval
+    path("*")
+
+  script:
+  i = interval.getSimpleName()
+  recal = "recalibrated_mapping_${i}.bam"
+  """
+  gatk ApplyBQSR -R ${params.malaria_ref} -I ${bam} --bqsr-recal-file ${recalibration_table} -O ${recal}
+  """
+}
+
+process collect_bams {
+  /* 
+  Collect parallelized bams into a single bam
+  */
+	publishDir { params.results + pubDir + "/" + "collect_bams" } , mode: "copy"
+  label 'trivial'
+  
+  input:
+  	path(bam_files)
+  	val(pubDir)
+ 
+  output:
+    path("merged.bam"), emit: bam
+    path("*")
+
+  script:
+  """
+		samtools merge merged.bam ${bam_files}
+    samtools index merged.bam
+  """
+}
+
+process haplotype_Caller {
+  /* 
+  Run gatk haplotyper caller to call variants
+  */
+	publishDir { params.results + pubDir + "/" + "haplotype_Caller" } , mode: "copy"
+  label 'BQSR'
+  
+  input:
+  	path(bams)
+  	path(interval)
+  	val(pubDir)
+ 
+  output:
+    path(output), emit: gvcf
+    path("*")
+
+  script:
+  i = interval.getSimpleName()
+  output = "output.${i}.g.vcf.gz"
+  """
+  gatk HaplotypeCaller -ploidy 1 -R ${params.malaria_ref} -I ${bams} -O ${output} -L ${interval} --emit-ref-confidence GVCF
+#  bcftools index ${output} 
+  """
+}
+
+process train_dragen_STR_model {
+  /* 
+  Train dragen model
+  */
+  publishDir { params.results + pubDir + "/" + "str_model" } , mode: "copy"
+  label 'BQSR'
+  
+  input:
+    path(bam)
+    val(pubDir)
+ 
+  output:
+    path("str.params"), emit: params
+    path("*")
+
+  script:
+  """
+  gatk ComposeSTRTableFile -R ${params.malaria_ref} --output reference.str.zip
+  gatk CalibrateDragstrModel --input ${bam} --output str.params --reference ${params.malaria_ref} --str-table-path reference.str.zip
+  """
+}
+
+process haplotype_Caller_dragen {
+  /* 
+  Perform haplotype calling using dragen
+  */
+  publishDir { params.results + pubDir + "/" + "haplotype_Caller" } , mode: "copy"
+  label 'BQSR'
+  
+  input:
+    path(bam)
+    path(dragen_STR_model)
+    path(interval)
+    val(pubDir)
+ 
+  output:
+    path(output), emit: vcf
+    path("*")
+
+  script:
+  i = interval.getSimpleName()
+  output = "${params.prefix}_${i}.g.vcf"
+
+  """
+  gatk HaplotypeCaller --dragen-mode -L ${interval} --dragstr-params-path ${dragen_STR_model} -R ${params.malaria_ref} -I ${bam} -O ${output} --emit-ref-confidence GVCF
+  """
+}
+
+process combineGVCF {
+  /* 
+  Combine parallelized VCF files into a single VCF
+  */
+	publishDir { params.results + pubDir + "/" + "combineGVCF" } , mode: "copy"
+  label 'trivial'
+  
+  input:
+  	path(gvcf)
+  	val(pubDir)
+ 
+  output:
+    path(output), emit: gvcf
+    path("*")
+
+  script:
+  output = "combined.g.vcf"
+  com_string = gvcf.join(" --variant ")
+
+  """
+    for file in *.vcf*; do gatk IndexFeatureFile -I \${file} -O \${file}.tbi; done
+		gatk CombineGVCFs -R ${params.malaria_ref} --variant ${com_string} -O ${output}
+  """
+}
+
+process genotypeGVCF {
+  /* 
+  Provide meaningful analysis of gvcf files
+  */
+	publishDir { params.results + pubDir + "/" + "genotypeGVCF" } , mode: "copy"
+  label 'BQSR'
+
+  input:
+  	path(gvcf)
+  	val(pubDir)
+ 
+  output:
+    path(output), emit: gvcf
+    path("*")
+
+  script:
+  output = "genotyped.g.vcf"
+  """
+ 		gatk GenotypeGVCFs -R ${params.malaria_ref} --variant ${gvcf} -O ${output}  
+ 	"""
+}
+
+process variant_recalibrator_snp {
+  /* 
+  Use known variants to recalibrate variant calling
+  */
+	publishDir { params.results + pubDir + "/" + "variantRecalibrator" } , mode: "copy"
+  label 'VR'
+  module 'R'
+
+  input:
+  	path(gvcf)
+  	val(pubDir)
+ 
+  output:
+    path(output_table), emit: table
+    path(output_tranche), emit: tranche
+    path("*")
+
+  script:
+  output_table = "vcf_calibration.recal"
+  output_tranche = "recalibration.tranche"
+  """
+ 	 gatk VariantRecalibrator -R ${params.malaria_ref} -V ${gvcf} \
+   --resource:pass1_1,known=false,training=true,truth=true,prior=15.0 ${params.var_1} \
+   --resource:pass1_2,known=false,training=true,truth=true,prior=15.0 ${params.var_2} \
+   --resource:pass1_3,known=false,training=true,truth=true,prior=15.0 ${params.var_3} \
+ 	 -an QD -an FS -an SOR -an DP \
+ 	 --max-gaussians 8 \
+ 	 -mq-cap 70 \
+   -mode SNP \
+   -O ${output_table} \
+   --tranches-file ${output_tranche} \
+   --rscript-file output.plots.R
+
+   gatk IndexFeatureFile -I ${output_table} -O ${output_table}.tbi
+
+ 	"""
+}
+
+process applyVQSR_snp {
+  /* 
+  Apply recalibration to variant calling
+  */
+	publishDir { params.results + pubDir + "/" + "Apply_variants" } , mode: "copy"
+  label 'VR'
+  
+  input:
+  	path(vcf)
+  	path(recal_table)
+  	path(recal_tranche)
+  	val(pubDir)
+ 
+  output:
+    path(output), emit: vcf
+    path("*")
+
+  script:
+  output = "${params.prefix}_snps.vcf"
+  """
+   gatk IndexFeatureFile -I ${recal_table} -O ${recal_table}.idx
+	 gatk ApplyVQSR -R ${params.malaria_ref} -V ${vcf} -O ${output} \
+   --truth-sensitivity-filter-level 99.0 \
+   --tranches-file ${recal_tranche} \
+   --recal-file ${recal_table} \
+   --create-output-variant-index \
+   -mode SNP
+ 	"""
+}
+
+process filter_core_variant {
+  /* 
+  filter variants to core genome and to minimum quality
+  */
+  publishDir { params.results + pubDir + "/" + "filter_core_variant" } , mode: "copy"
+  label 'VR'
+  
+  input:
+    path(gvcf)
+    val(pubDir)
+ 
+  output:
+    path("*")
+
+  script:
+  """
+  gatk VariantFiltration -V ${gvcf} --filter-expression "QUAL < 10.4139" --filter-name "hard_qual" -O ${params.prefix}}.filtered.g.vcf
+  gatk FilterVcf -I ${params.prefix}}.filtered.g.vcf --OUTPUT min_depth.g.vcf --MIN_DP 15
+  vcftools --vcf min_depth.g.vcf --bed ${params.malaria_core} --out core --recode
+  vcftools --vcf core.recode.vcf --exclude-positions ${params.var_1} --recode --out var1_removed
+  vcftools --vcf var1_removed.recode.vcf --exclude-positions ${params.var_2} --recode --out var2_removed
+  vcftools --vcf var2_removed.recode.vcf --exclude-positions ${params.var_3} --recode --out all_removed
+  """
+}
