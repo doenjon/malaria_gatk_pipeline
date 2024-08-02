@@ -1,3 +1,4 @@
+Primarily meant to be documentation for https://doi.org/10.1128/aac.01238-23
 
 This repository contains an implementation of the [GATK](https://gatk.broadinstitute.org/hc/en-us/articles/360035535932-Germline-short-variant-discovery-SNPs-Indels-) germline short variant discovery best practices pipeline using both the old school (BWA) and updated (DRAGEN) alignment strategies
 
